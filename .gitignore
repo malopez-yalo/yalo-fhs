@@ -1,0 +1,35 @@
+# ── Credenciales — NUNCA subir ──────────────────────────────
+gcloud_creds.json
+*.json
+service_account*.json
+credentials*.json
+*_key.json
+.env
+
+# ── Node / Dashboard ────────────────────────────────────────
+node_modules/
+dist/
+.next/
+.cache/
+*.tsbuildinfo
+
+# ── Python / ETL ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# ── Logs y datos temporales ─────────────────────────────────
+etl_log.txt
+*.log
+*.csv.bak
+
+# ── macOS ───────────────────────────────────────────────────
+.DS_Store
+.~lock.*
+
+# ── Replit ──────────────────────────────────────────────────
+.replit.nix
+.upm/
+replit.nix
