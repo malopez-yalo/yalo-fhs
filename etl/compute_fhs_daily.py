@@ -42,20 +42,22 @@ WITH oris_inputs AS (
   SELECT * FROM `commerce-sandbox.DWH_STAGE.fhs_oris_inputs`
 ),
 
+-- ⚠️ CIE TEMPORALMENTE DESHABILITADO — falta acceso a dev-data-mlops
+-- Restablecer cuando Gera otorgue roles/bigquery.dataViewer en dev-data-mlops
+-- a maria.lopez@yalo.com. El script corre sin CIE usando la lógica adaptativa:
+-- los pesos de A, B, C, D se redistribuyen automáticamente (COALESCE → 0).
 cie_inputs AS (
   SELECT
-    workflow_name                                                                 AS bot_id,
-    DATE_TRUNC(analysis_date, WEEK)                                              AS week_start,
-    ROUND(AVG(CASE WHEN metric_name = 'closure'               THEN avg_score END) * 100, 2) AS closure_rate,
-    ROUND(AVG(CASE WHEN metric_name = 'resolution'            THEN avg_score END) * 100, 2) AS resolution_rate_ux,
-    ROUND(AVG(CASE WHEN metric_name = 'confusion_detection'   THEN avg_score END) * 100, 2) AS confusion_detection_score,
-    ROUND(AVG(CASE WHEN metric_name = 'frustration_detection' THEN avg_score END) * 100, 2) AS frustration_ux_score,
-    ROUND(AVG(CASE WHEN metric_name = 'efficiency'            THEN avg_score END) * 100, 2) AS efficiency_score,
-    ROUND(AVG(CASE WHEN metric_name = 'loop_prevention'       THEN avg_score END) * 100, 2) AS loop_prevention_score,
-    ROUND(AVG(CASE WHEN metric_name = 'proactive_anticipation' THEN avg_score END) * 100, 2) AS proactive_anticipation_score
-  FROM `arched-photon-194421.conversational_insights.v_cross_metric_scorecard`
-  WHERE analysis_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 WEEK)
-  GROUP BY 1, 2
+    CAST(NULL AS STRING)  AS bot_id,
+    CAST(NULL AS DATE)    AS week_start,
+    CAST(NULL AS FLOAT64) AS closure_rate,
+    CAST(NULL AS FLOAT64) AS resolution_rate_ux,
+    CAST(NULL AS FLOAT64) AS confusion_detection_score,
+    CAST(NULL AS FLOAT64) AS frustration_ux_score,
+    CAST(NULL AS FLOAT64) AS efficiency_score,
+    CAST(NULL AS FLOAT64) AS loop_prevention_score,
+    CAST(NULL AS FLOAT64) AS proactive_anticipation_score
+  FROM (SELECT 1 AS dummy) WHERE 1 = 0
 ),
 
 latency_inputs AS (
@@ -182,6 +184,45 @@ ca_evals_inputs AS (
     AND r.langsmith_tracing_project_name = 'custom-agents-production'
     AND r.id = r.trace_id
     AND f.created_at >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 2 WEEK))
+    AND r.start_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 2 WEEK))  -- partition filter en runs ✅
+  GROUP BY 1, 2
+),
+
+-- ── Token costs desde LangSmith runs (join directo, sin feedbacks) ────────────
+-- Propósito: costo por conversación, tokens promedio, cache hit rate
+-- Join: runs solo (no feedbacks) — bot_id extraído del mismo JSON que ca_evals_inputs
+-- Nota: evals usan join trace_id (calidad conversacional)
+--       costs usan runs directamente (costo por LLM call, agrupado por trace)
+ca_costs_inputs AS (
+  SELECT
+    COALESCE(
+      NULLIF(REPLACE(JSON_EXTRACT_SCALAR(r.extra, '$.metadata.workflow_name'), '"', ''), ''),
+      REPLACE(JSON_EXTRACT_SCALAR(r.extra, '$.metadata.workflow'), '"', '')
+    )                                                                       AS bot_id,
+    DATE_TRUNC(DATE(r.start_time), WEEK)                                   AS week_start,
+    -- Costo total de la semana (suma de todos los LLM calls del bot)
+    ROUND(SUM(r.total_cost), 4)                                            AS total_cost_usd,
+    -- Conversaciones únicas (traces raíz)
+    COUNT(DISTINCT r.trace_id)                                             AS ca_cost_conversations,
+    -- Costo promedio por conversación
+    ROUND(SAFE_DIVIDE(SUM(r.total_cost),
+      NULLIF(COUNT(DISTINCT r.trace_id), 0)), 6)                           AS avg_cost_per_conv_usd,
+    -- Tokens promedio por conversación (eficiencia de prompts)
+    ROUND(SAFE_DIVIDE(SUM(r.total_tokens),
+      NULLIF(COUNT(DISTINCT r.trace_id), 0)), 0)                           AS avg_tokens_per_conv,
+    -- Cache hit rate: % de prompt tokens que vinieron de caché (0–1)
+    ROUND(SAFE_DIVIDE(
+      SUM(CAST(JSON_VALUE(r.prompt_token_details, '$.cache_read') AS INT64)),
+      NULLIF(SUM(r.prompt_tokens), 0)
+    ), 4)                                                                  AS cache_hit_rate
+  FROM `arched-photon-194421.DWH2_STAGE.st_genai_langsmith_runs` r
+  WHERE r.start_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 2 WEEK))
+    AND r.langsmith_workspace_name IN ('Oris', 'Custom Agents')
+    AND r.langsmith_tracing_project_name IN (
+        'ml-gai-service-production',
+        'custom-agents-production'
+    )
+    AND r.run_type IN ('chain', 'llm')   -- excluir evaluator runs del costo
   GROUP BY 1, 2
 ),
 
@@ -342,7 +383,17 @@ combined AS (
     o.s2_domain_count,
     o.s3_toxic_count,
     ca.ca_domain_safety_rate,
-    ca.ca_no_toxicity_rate
+    ca.ca_no_toxicity_rate,
+
+    -- ── Token costs (diagnóstico — no modifican la fórmula FHS por ahora) ─────
+    -- Fuente: LangSmith runs (Oris + Custom Agents)
+    -- avg_cost_per_conv_usd: referencia GLRS ≤ $0.05
+    -- avg_tokens_per_conv:   referencia GLRS ≤ 4,000
+    -- cache_hit_rate:        referencia GLRS ≥ 0.40
+    cc.total_cost_usd,
+    cc.avg_cost_per_conv_usd,
+    cc.avg_tokens_per_conv,
+    cc.cache_hit_rate
 
   FROM oris_inputs o
   LEFT JOIN cie_inputs         c  ON o.bot_id = c.bot_id  AND o.week_start = c.week_start
@@ -354,6 +405,7 @@ combined AS (
   LEFT JOIN ca_sessions_inputs cs ON o.bot_id = cs.bot_id AND o.week_start = cs.week_start
   LEFT JOIN fb_transitions_inputs ft ON o.bot_id = ft.bot_id AND o.week_start = ft.week_start
   LEFT JOIN funnel_inputs      fu ON o.bot_id = fu.bot_id AND o.week_start = fu.week_start
+  LEFT JOIN ca_costs_inputs    cc ON o.bot_id = cc.bot_id AND o.week_start = cc.week_start
 
   -- Solo la semana en curso
   WHERE o.week_start = DATE_TRUNC(CURRENT_DATE(), WEEK)
@@ -445,7 +497,12 @@ SELECT
   total_conversations,
   has_oris_data,
   s1_active,
-  CURRENT_DATE()                                                            AS snapshot_date
+  CURRENT_DATE()                                                            AS snapshot_date,
+  -- Token costs (diagnóstico) — columnas agregadas con ALTER TABLE, van al final
+  total_cost_usd,
+  avg_cost_per_conv_usd,
+  avg_tokens_per_conv,
+  cache_hit_rate
 FROM scored
 """
 

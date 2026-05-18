@@ -172,6 +172,36 @@ ca_evals_inputs AS (
     AND r.langsmith_tracing_project_name = 'custom-agents-production'
     AND r.id = r.trace_id
     AND f.created_at >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 52 WEEK))
+    AND r.start_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 52 WEEK))  -- partition filter en runs ✅
+  GROUP BY 1, 2
+),
+
+-- ── Token costs desde LangSmith runs (backfill 52 semanas) ────────────────────
+ca_costs_inputs AS (
+  SELECT
+    COALESCE(
+      NULLIF(REPLACE(JSON_EXTRACT_SCALAR(r.extra, '$.metadata.workflow_name'), '"', ''), ''),
+      REPLACE(JSON_EXTRACT_SCALAR(r.extra, '$.metadata.workflow'), '"', '')
+    )                                                                       AS bot_id,
+    DATE_TRUNC(DATE(r.start_time), WEEK)                                   AS week_start,
+    ROUND(SUM(r.total_cost), 4)                                            AS total_cost_usd,
+    COUNT(DISTINCT r.trace_id)                                             AS ca_cost_conversations,
+    ROUND(SAFE_DIVIDE(SUM(r.total_cost),
+      NULLIF(COUNT(DISTINCT r.trace_id), 0)), 6)                           AS avg_cost_per_conv_usd,
+    ROUND(SAFE_DIVIDE(SUM(r.total_tokens),
+      NULLIF(COUNT(DISTINCT r.trace_id), 0)), 0)                           AS avg_tokens_per_conv,
+    ROUND(SAFE_DIVIDE(
+      SUM(CAST(JSON_VALUE(r.prompt_token_details, '$.cache_read') AS INT64)),
+      NULLIF(SUM(r.prompt_tokens), 0)
+    ), 4)                                                                  AS cache_hit_rate
+  FROM `arched-photon-194421.DWH2_STAGE.st_genai_langsmith_runs` r
+  WHERE r.start_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 52 WEEK))
+    AND r.langsmith_workspace_name IN ('Oris', 'Custom Agents')
+    AND r.langsmith_tracing_project_name IN (
+        'ml-gai-service-production',
+        'custom-agents-production'
+    )
+    AND r.run_type IN ('chain', 'llm')
   GROUP BY 1, 2
 ),
 
@@ -304,18 +334,25 @@ combined AS (
     o.s2_domain_count,
     o.s3_toxic_count,
     ca.ca_domain_safety_rate,
-    ca.ca_no_toxicity_rate
+    ca.ca_no_toxicity_rate,
+
+    -- Token costs (diagnóstico)
+    cc.total_cost_usd,
+    cc.avg_cost_per_conv_usd,
+    cc.avg_tokens_per_conv,
+    cc.cache_hit_rate
 
   FROM oris_inputs o
-  LEFT JOIN cie_inputs         c  ON o.bot_id = c.bot_id  AND o.week_start = c.week_start
-  LEFT JOIN latency_inputs     l  ON o.bot_id = l.bot_id  AND o.week_start = l.week_start
-  LEFT JOIN flowbuilder_inputs fb ON o.bot_id = fb.bot_id AND o.week_start = fb.week_start
-  LEFT JOIN errors_inputs      er ON o.bot_id = er.bot_id AND o.week_start = er.week_start
-  LEFT JOIN s1_incidents       s1 ON o.bot_id = s1.bot_id AND o.week_start = s1.week_start
-  LEFT JOIN ca_evals_inputs      ca ON o.bot_id = ca.bot_id AND o.week_start = ca.week_start
-  LEFT JOIN ca_sessions_inputs   cs ON o.bot_id = cs.bot_id AND o.week_start = cs.week_start
+  LEFT JOIN cie_inputs            c  ON o.bot_id = c.bot_id  AND o.week_start = c.week_start
+  LEFT JOIN latency_inputs        l  ON o.bot_id = l.bot_id  AND o.week_start = l.week_start
+  LEFT JOIN flowbuilder_inputs    fb ON o.bot_id = fb.bot_id AND o.week_start = fb.week_start
+  LEFT JOIN errors_inputs         er ON o.bot_id = er.bot_id AND o.week_start = er.week_start
+  LEFT JOIN s1_incidents          s1 ON o.bot_id = s1.bot_id AND o.week_start = s1.week_start
+  LEFT JOIN ca_evals_inputs       ca ON o.bot_id = ca.bot_id AND o.week_start = ca.week_start
+  LEFT JOIN ca_sessions_inputs    cs ON o.bot_id = cs.bot_id AND o.week_start = cs.week_start
   LEFT JOIN fb_transitions_inputs ft ON o.bot_id = ft.bot_id AND o.week_start = ft.week_start
   LEFT JOIN funnel_inputs         fu ON o.bot_id = fu.bot_id AND o.week_start = fu.week_start
+  LEFT JOIN ca_costs_inputs       cc ON o.bot_id = cc.bot_id AND o.week_start = cc.week_start
 ),
 
 scored AS (
@@ -394,6 +431,10 @@ SELECT
   total_conversations,
   has_oris_data,
   s1_active,
+  total_cost_usd,
+  avg_cost_per_conv_usd,
+  avg_tokens_per_conv,
+  cache_hit_rate,
   CURRENT_DATE()                                                            AS snapshot_date
 FROM scored
 WHERE (bot_id, week_start) NOT IN (
